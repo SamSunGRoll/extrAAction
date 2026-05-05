@@ -152,10 +152,18 @@ def upsert_beneficiary(farmer_info, row):
     beneficiary_district = get_from_sources("Tirupathi", row.get("district", ""), farmer_info.get("district", ""))
     beneficiary_mandal = get_from_sources("Tirupathi Rural", row.get("mandal", ""), farmer_info.get("mandal", ""))
 
+    beneficiary_village = get_from_sources(
+        "Unknown Village",
+        row.get("village", ""),
+        farmer_info.get("village", ""),
+    )
+    if len(clean_str(beneficiary_village)) < 2:
+        beneficiary_village = "Unknown Village"
+
     payload = {
         "beneficiary_id": beneficiary_id,
         "name": get_from_sources("UNKNOWN", farmer_info.get("farmerName", ""), row.get("farmer_name", "")),
-        "village": clean_str(row.get("village", "")),
+        "village": beneficiary_village,
         "mandal": beneficiary_mandal,
         "district": beneficiary_district,
         "state": beneficiary_state,
