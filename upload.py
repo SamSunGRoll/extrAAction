@@ -6,7 +6,7 @@ import requests
 from tqdm import tqdm
 
 # ===== CONFIG =====
-TEST_MODE = True
+TEST_MODE = False
 TEST_LIMIT = 20
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
