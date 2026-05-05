@@ -130,13 +130,17 @@ def upsert_beneficiary(farmer_info, row):
     if beneficiary_id == "":
         beneficiary_id = f"BEN_{clean_str(row.get('godhaar', 'UNKNOWN'))}"
 
+    beneficiary_state = get_from_sources("Andhra Pradesh", row.get("state", ""), farmer_info.get("state", ""))
+    beneficiary_district = get_from_sources("Tirupathi", row.get("district", ""), farmer_info.get("district", ""))
+    beneficiary_mandal = get_from_sources("Tirupathi Rural", row.get("mandal", ""), farmer_info.get("mandal", ""))
+
     payload = {
         "beneficiary_id": beneficiary_id,
         "name": get_from_sources("UNKNOWN", farmer_info.get("farmerName", ""), row.get("farmer_name", "")),
         "village": clean_str(row.get("village", "")),
-        "mandal": "TPT01",
-        "district": "TPT",
-        "state": "AP",
+        "mandal": beneficiary_mandal,
+        "district": beneficiary_district,
+        "state": beneficiary_state,
         "phone_number": clean_str(farmer_info.get("phonenumber", "")),
         "num_of_items": num_of_items,
     }
