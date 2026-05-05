@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import json
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -16,6 +17,7 @@ BENEFICIARY_API_URL = "http://107.210.222.39:9000/beneficiaries/"
 MILCHANIMALS_API_URL = "http://107.210.222.39:9000/milchanimals/"
 QR_GENERATE_API_URL = "http://107.210.222.39:9000/qr/generate"
 DEFAULT_DEV_API_KEY = "7f2d9b8c-3a1e-4f6b-9c2d-8e7a6b5c4d3f"
+CHECKPOINT_FILE = "upload_checkpoint.jsonl"
 
 main_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_Rural.xlsx"
 farmer_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_rural_farmers.xlsx"
@@ -293,6 +295,45 @@ def request_with_retry(url, data=None, files=None, json=None, timeout=30):
             raise last_exception
     return last_response
 
+def load_checkpoint(path):
+    processed = {}
+    if not os.path.exists(path):
+        return processed
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                gid = clean_str(obj.get("godhaar", ""))
+                if gid:
+                    processed[gid] = obj
+            except Exception:
+                continue
+    return processed
+
+def save_checkpoint(path, godhaar, payload):
+    entry = {"godhaar": godhaar, "ts": int(time.time())}
+    if isinstance(payload, dict):
+        entry.update(payload)
+    else:
+        entry["status"] = str(payload)
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def append_unique_lines(path, items):
+    existing = set()
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            existing = {line.strip() for line in f if line.strip()}
+    new_items = [item for item in items if item and item not in existing]
+    if not new_items:
+        return
+    with open(path, "a") as f:
+        for item in new_items:
+            f.write(item + "\n")
+
 def get_face_path(godhaar):
     path = os.path.join(faces_dir, godhaar, f"{godhaar}.jpg")
     return path if os.path.exists(path) else None
@@ -335,6 +376,25 @@ beneficiary_failed_ids = []
 milchanimal_failed_ids = []
 qr_failed_ids = []
 
+checkpoint_map = load_checkpoint(CHECKPOINT_FILE)
+processed_ids = set(checkpoint_map.keys())
+
+# Recover prior run counters from checkpoint for resumable summaries/logs.
+for gid, entry in checkpoint_map.items():
+    status = entry.get("status", "")
+    if status == "success":
+        success_ids.append(gid)
+    elif status == "failed":
+        failed_ids.append(gid)
+    elif status == "skipped":
+        skipped_ids.append(gid)
+    if entry.get("beneficiary_failed"):
+        beneficiary_failed_ids.append(gid)
+    if entry.get("milchanimal_failed"):
+        milchanimal_failed_ids.append(gid)
+    if entry.get("qr_failed"):
+        qr_failed_ids.append(gid)
+
 # ===== TEST MODE =====
 if TEST_MODE:
     df = df.head(TEST_LIMIT)
@@ -343,8 +403,11 @@ if TEST_MODE:
 # ===== MAIN LOOP =====
 for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
     godhaar = str(row["godhaar"]).strip()
+    if godhaar in processed_ids:
+        continue
     if clean_str(godhaar) == "":
         skipped_ids.append("MISSING_GODHAAR")
+        save_checkpoint(CHECKPOINT_FILE, "MISSING_GODHAAR", "skipped")
         continue
 
     # ---- Farmer Mapping ----
@@ -363,11 +426,23 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
             skipped_ids.append(godhaar)
             print(f"\n❌ Beneficiary create failed for {godhaar} -> {ben_response.status_code} | {ben_response.text}")
             print(f"   sent beneficiary payload: {ben_payload}")
+            save_checkpoint(CHECKPOINT_FILE, godhaar, {
+                "status": "skipped",
+                "beneficiary_failed": True,
+                "milchanimal_failed": False,
+                "qr_failed": False,
+            })
             continue
     except Exception as e:
         beneficiary_failed_ids.append(godhaar)
         skipped_ids.append(godhaar)
         print(f"\n❌ Beneficiary exception for {godhaar}: {e}")
+        save_checkpoint(CHECKPOINT_FILE, godhaar, {
+            "status": "skipped",
+            "beneficiary_failed": True,
+            "milchanimal_failed": False,
+            "qr_failed": False,
+        })
         continue
 
     # Normalize animal type with fallback default.
@@ -384,6 +459,12 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
             milchanimal_failed_ids.append(godhaar)
             if milch_response is None:
                 print(f"\n❌ Milchanimal create failed for {godhaar} -> validation | {milch_payload}")
+                save_checkpoint(CHECKPOINT_FILE, godhaar, {
+                    "status": "failed",
+                    "beneficiary_failed": False,
+                    "milchanimal_failed": True,
+                    "qr_failed": False,
+                })
                 continue
             print(f"\n❌ Milchanimal create failed for {godhaar} -> {milch_response.status_code} | {milch_response.text}")
             print(f"   sent milchanimal payload: {milch_payload}")
@@ -398,6 +479,12 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
     muzzle_paths = sorted(get_muzzle_paths(godhaar))
     if not face_path:
         skipped_ids.append(godhaar)
+        save_checkpoint(CHECKPOINT_FILE, godhaar, {
+            "status": "skipped",
+            "beneficiary_failed": False,
+            "milchanimal_failed": not milchanimal_ok,
+            "qr_failed": False,
+        })
         continue
     if len(muzzle_paths) == 0:
         muzzle_paths = [face_path]
@@ -467,14 +554,32 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
             else:
                 qr_failed_ids.append(godhaar)
                 print(f"\n⚠️ QR skipped for {godhaar} because milchanimal creation failed.")
+            save_checkpoint(CHECKPOINT_FILE, godhaar, {
+                "status": "success",
+                "beneficiary_failed": False,
+                "milchanimal_failed": not milchanimal_ok,
+                "qr_failed": godhaar in qr_failed_ids,
+            })
         else:
             failed_ids.append(godhaar)
             print(f"\n❌ {godhaar} → {response.status_code} | {response.text}")
             print(f"   sent data: {data}")
+            save_checkpoint(CHECKPOINT_FILE, godhaar, {
+                "status": "failed",
+                "beneficiary_failed": False,
+                "milchanimal_failed": not milchanimal_ok,
+                "qr_failed": False,
+            })
 
     except Exception as e:
         failed_ids.append(godhaar)
         print(f"\n❌ Exception for {godhaar}: {e}")
+        save_checkpoint(CHECKPOINT_FILE, godhaar, {
+            "status": "failed",
+            "beneficiary_failed": False,
+            "milchanimal_failed": not milchanimal_ok,
+            "qr_failed": False,
+        })
     finally:
         for _, f in files:
             try:
@@ -483,23 +588,12 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
                 pass
 
 # ===== SAVE LOGS =====
-with open("success_ids.txt", "w") as f:
-    f.write("\n".join(success_ids))
-
-with open("failed_ids.txt", "w") as f:
-    f.write("\n".join(failed_ids))
-
-with open("skipped_ids.txt", "w") as f:
-    f.write("\n".join(skipped_ids))
-
-with open("beneficiary_failed_ids.txt", "w") as f:
-    f.write("\n".join(beneficiary_failed_ids))
-
-with open("milchanimal_failed_ids.txt", "w") as f:
-    f.write("\n".join(milchanimal_failed_ids))
-
-with open("qr_failed_ids.txt", "w") as f:
-    f.write("\n".join(qr_failed_ids))
+append_unique_lines("success_ids.txt", success_ids)
+append_unique_lines("failed_ids.txt", failed_ids)
+append_unique_lines("skipped_ids.txt", skipped_ids)
+append_unique_lines("beneficiary_failed_ids.txt", beneficiary_failed_ids)
+append_unique_lines("milchanimal_failed_ids.txt", milchanimal_failed_ids)
+append_unique_lines("qr_failed_ids.txt", qr_failed_ids)
 
 # ===== SUMMARY =====
 print("\n" + "=" * 50)
