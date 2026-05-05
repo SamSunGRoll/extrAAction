@@ -110,7 +110,8 @@ def build_location(row, farmer_info):
 
     raw_location = get_from_sources("", row.get("location", ""), farmer_info.get("location", ""))
     if raw_location == "":
-        return ""
+        # Always return API-valid fallback format: "lat,lon"
+        return "0,0"
 
     # Handle dict/json-like text from Excel such as:
     # "{'longitude': 79.47, 'latitude': 13.58, 'timestamp': '...'}"
