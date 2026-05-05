@@ -2,3 +2,6 @@ myenv/
 failed_ids.txt
 skipped_ids.txt
 success_ids.txt
+beneficiary_failed_ids.txt
+milchanimal_failed_ids.txt
+qr_failed_ids.txt
