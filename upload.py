@@ -177,15 +177,7 @@ def upsert_milchanimal(farmer_info, row, godhaar, animal_type):
         default=0,
     )
     tag_no = get_from_sources(godhaar, row.get("tag_no", ""), farmer_info.get("tag_no", ""), godhaar)
-    animal_id = get_from_sources(
-        "",
-        row.get("animal_id", ""),
-        farmer_info.get("animal_id", ""),
-    )
-    if animal_id == "":
-        animal_id = f"ANIMAL_{godhaar}"
-    if animal_id == tag_no:
-        animal_id = f"{animal_id}_ID"
+    animal_id = godhaar
     animal_photo = get_from_sources("", row.get("animal_photo", ""), farmer_info.get("animal_photo", ""))
     health_cert = get_from_sources("", row.get("health_cert", ""), farmer_info.get("health_cert", ""))
     valuation_cert = get_from_sources("", row.get("valuation_cert", ""), farmer_info.get("valuation_cert", ""))
@@ -312,6 +304,9 @@ if TEST_MODE:
 # ===== MAIN LOOP =====
 for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
     godhaar = str(row["godhaar"]).strip()
+    if clean_str(godhaar) == "":
+        skipped_ids.append("MISSING_GODHAAR")
+        continue
 
     # ---- Farmer Mapping ----
     farmer_info = farmers_map.get(godhaar)
@@ -347,6 +342,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
         ok, milch_payload, milch_response = upsert_milchanimal(farmer_info, row, godhaar, animal_type)
         if not ok:
             milchanimal_failed_ids.append(godhaar)
+            if milch_response is None:
+                print(f"\n❌ Milchanimal create failed for {godhaar} -> validation | {milch_payload}")
+                continue
             print(f"\n❌ Milchanimal create failed for {godhaar} -> {milch_response.status_code} | {milch_response.text}")
             print(f"   sent milchanimal payload: {milch_payload}")
     except Exception as e:
