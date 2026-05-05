@@ -1,4 +1,5 @@
 import os
+import time
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -6,8 +7,13 @@ from tqdm import tqdm
 # ===== CONFIG =====
 TEST_MODE = True
 TEST_LIMIT = 10
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
 
-API_URL = "http://107.210.222.39:9000/registerCattle/manual"
+REGISTER_CATTLE_API_URL = "http://107.210.222.39:9000/registerCattle/manual"
+BENEFICIARY_API_URL = "http://107.210.222.39:9000/beneficiaries/"
+MILCHANIMALS_API_URL = "http://107.210.222.39:9000/milchanimals/"
+QR_GENERATE_API_URL = "http://107.210.222.39:9000/qr/generate"
 
 main_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_Rural.xlsx"
 farmer_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_rural_farmers.xlsx"
@@ -44,6 +50,201 @@ def parse_age(age_str):
         return years * 12 + months
     except:
         return 0
+
+def clean_str(value):
+    value = str(value).strip()
+    return "" if value in ("nan", "None") else value
+
+def to_int_or_default(value, default=0):
+    try:
+        text = str(value).strip()
+        if text in ("", "nan", "None"):
+            return default
+        return int(float(text))
+    except Exception:
+        return default
+
+def to_float_or_default(value, default=0.0):
+    try:
+        text = str(value).strip()
+        if text in ("", "nan", "None"):
+            return default
+        return float(text)
+    except Exception:
+        return default
+
+def get_from_sources(default, *values):
+    for value in values:
+        cleaned = clean_str(value)
+        if cleaned != "":
+            return cleaned
+    return default
+
+def build_location(row, farmer_info):
+    lat = get_from_sources(
+        "",
+        row.get("latitude", ""),
+        row.get("lat", ""),
+        farmer_info.get("latitude", ""),
+        farmer_info.get("lat", ""),
+    )
+    lon = get_from_sources(
+        "",
+        row.get("longitude", ""),
+        row.get("lon", ""),
+        row.get("lng", ""),
+        farmer_info.get("longitude", ""),
+        farmer_info.get("lon", ""),
+        farmer_info.get("lng", ""),
+    )
+    if lat != "" and lon != "":
+        return f"{lat},{lon}"
+    return get_from_sources("", row.get("location", ""), farmer_info.get("location", ""))
+
+def map_register_state(value):
+    text = clean_str(value).lower()
+    if text in ("andhra pradesh", "ap"):
+        return "AP"
+    return value if clean_str(value) else "AP"
+
+def map_register_district(value):
+    text = clean_str(value).lower()
+    if text in ("tirupathi", "tirupati", "tpt"):
+        return "TPT"
+    return value if clean_str(value) else "TPT"
+
+def map_register_mandal(value):
+    text = clean_str(value).lower()
+    if text in ("tirupathi rural", "tirupati rural", "tpt02"):
+        return "TPT02"
+    return value if clean_str(value) else "TPT01"
+
+def upsert_beneficiary(farmer_info, row):
+    num_of_items = to_int_or_default(
+        farmer_info.get("num_of_items", row.get("num_of_items", 0)),
+        default=0,
+    )
+
+    beneficiary_id = clean_str(farmer_info.get("farmerId", row.get("farmerId", "")))
+    if beneficiary_id == "":
+        beneficiary_id = f"BEN_{clean_str(row.get('godhaar', 'UNKNOWN'))}"
+
+    payload = {
+        "beneficiary_id": beneficiary_id,
+        "name": get_from_sources("UNKNOWN", farmer_info.get("farmerName", ""), row.get("farmer_name", "")),
+        "village": clean_str(row.get("village", "")),
+        "mandal": "TPT01",
+        "district": "TPT",
+        "state": "AP",
+        "phone_number": clean_str(farmer_info.get("phonenumber", "")),
+        "num_of_items": num_of_items,
+    }
+    response = request_with_retry(BENEFICIARY_API_URL, json=payload)
+
+    # Treat duplicate/already-exists as success to keep script idempotent.
+    if response.status_code in [200, 201, 409]:
+        return True, payload, response
+
+    return False, payload, response
+
+def upsert_milchanimal(farmer_info, row, godhaar, animal_type):
+    village = get_from_sources("", row.get("village", ""), farmer_info.get("village", ""))
+    beneficiary_id = get_from_sources(
+        "",
+        farmer_info.get("beneficiary_id", ""),
+        farmer_info.get("farmerId", ""),
+        row.get("beneficiary_id", ""),
+        row.get("farmerId", ""),
+    )
+    breed = get_from_sources("", row.get("breed", ""), farmer_info.get("breed", ""))
+    seller_id = get_from_sources("", row.get("seller_id", ""), farmer_info.get("seller_id", ""))
+    location = build_location(row, farmer_info)
+    cost = to_float_or_default(row.get("cost", farmer_info.get("cost", 0)), default=0)
+    insurance_premium = to_float_or_default(
+        row.get("insurance_premium", farmer_info.get("insurance_premium", 0)),
+        default=0,
+    )
+    pregnant_text = get_from_sources("", row.get("pregnant", ""), farmer_info.get("pregnant", ""))
+    pregnant = str(pregnant_text).strip().lower() in ("1", "true", "yes", "y")
+    pregnancy_months = to_int_or_default(
+        row.get("pregnancy_months", farmer_info.get("pregnancy_months", 0)),
+        default=0,
+    )
+    calf_type = get_from_sources("", row.get("calf_type", ""), farmer_info.get("calf_type", ""))
+    milk_yield_per_day = to_float_or_default(
+        row.get("milk_yield_per_day", farmer_info.get("milk_yield_per_day", 0)),
+        default=0,
+    )
+    tag_no = get_from_sources(godhaar, row.get("tag_no", ""), farmer_info.get("tag_no", ""), godhaar)
+    animal_id = get_from_sources(
+        "",
+        row.get("animal_id", ""),
+        farmer_info.get("animal_id", ""),
+    )
+    if animal_id == "":
+        animal_id = f"ANIMAL_{godhaar}"
+    if animal_id == tag_no:
+        animal_id = f"{animal_id}_ID"
+    animal_photo = get_from_sources("", row.get("animal_photo", ""), farmer_info.get("animal_photo", ""))
+    health_cert = get_from_sources("", row.get("health_cert", ""), farmer_info.get("health_cert", ""))
+    valuation_cert = get_from_sources("", row.get("valuation_cert", ""), farmer_info.get("valuation_cert", ""))
+
+    payload = {
+        "animal_id": animal_id,
+        "beneficiary_id": beneficiary_id,
+        "seller_id": seller_id,
+        "purchase_place": village,
+        "location": location,
+        "cost": cost,
+        "insurance_premium": insurance_premium,
+        "type": animal_type,
+        "breed": breed,
+        "pregnant": pregnant,
+        "pregnancy_months": pregnancy_months,
+        "calf_type": calf_type,
+        "milk_yield_per_day": milk_yield_per_day,
+        "tag_no": tag_no,
+        "animal_photo": animal_photo,
+        "health_cert": health_cert,
+        "valuation_cert": valuation_cert,
+    }
+    response = request_with_retry(MILCHANIMALS_API_URL, json=payload)
+    if response.status_code in [200, 201, 409]:
+        return True, payload, response
+    return False, payload, response
+
+def generate_qr(animal_id, state, district, mandal):
+    payload = {
+        "state": state,
+        "district": district,
+        "mandal": mandal,
+    }
+    url = f"{QR_GENERATE_API_URL}/{animal_id}"
+    response = request_with_retry(url, json=payload, timeout=30)
+    if response.status_code in [200, 201]:
+        return True, payload, response
+    return False, payload, response
+
+def request_with_retry(url, data=None, files=None, json=None, timeout=30):
+    last_response = None
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(url, data=data, files=files, json=json, timeout=timeout)
+            # retry only transient server/network style statuses
+            if response.status_code in (500, 502, 503, 504, 429):
+                last_response = response
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS)
+                    continue
+            return response
+        except Exception as exc:
+            last_exception = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise last_exception
+    return last_response
 
 def get_face_path(godhaar):
     path = os.path.join(faces_dir, godhaar, f"{godhaar}.jpg")
@@ -83,6 +284,9 @@ def get_side_paths(godhaar, face_path):
 success_ids = []
 failed_ids = []
 skipped_ids = []
+beneficiary_failed_ids = []
+milchanimal_failed_ids = []
+qr_failed_ids = []
 
 # ===== TEST MODE =====
 if TEST_MODE:
@@ -101,80 +305,121 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
 
     farmer_name = str(farmer_info["farmerName"]).strip()
 
-    # Normalize animal_type for API: must be "cow" or "buffalo"
-    animal_type = str(farmer_info["animalType"]).strip().lower()
-    if animal_type not in ("cow", "buffalo"):
+    # ---- Beneficiary Upsert ----
+    try:
+        ok, ben_payload, ben_response = upsert_beneficiary(farmer_info, row)
+        if not ok:
+            beneficiary_failed_ids.append(godhaar)
+            skipped_ids.append(godhaar)
+            print(f"\n❌ Beneficiary create failed for {godhaar} -> {ben_response.status_code} | {ben_response.text}")
+            print(f"   sent beneficiary payload: {ben_payload}")
+            continue
+    except Exception as e:
+        beneficiary_failed_ids.append(godhaar)
         skipped_ids.append(godhaar)
+        print(f"\n❌ Beneficiary exception for {godhaar}: {e}")
         continue
+
+    # Normalize animal type with fallback default.
+    animal_type = clean_str(farmer_info.get("animalType", "")).lower()
+    if animal_type not in ("cow", "buffalo"):
+        animal_type = "cow"
+
+    # ---- Milchanimal Upsert ----
+    milch_payload = {}
+    try:
+        ok, milch_payload, milch_response = upsert_milchanimal(farmer_info, row, godhaar, animal_type)
+        if not ok:
+            milchanimal_failed_ids.append(godhaar)
+            print(f"\n❌ Milchanimal create failed for {godhaar} -> {milch_response.status_code} | {milch_response.text}")
+            print(f"   sent milchanimal payload: {milch_payload}")
+    except Exception as e:
+        milchanimal_failed_ids.append(godhaar)
+        print(f"\n❌ Milchanimal exception for {godhaar}: {e}")
 
     # ---- Images ----
     face_path = get_face_path(godhaar)
-    muzzle_paths = sorted(get_muzzle_paths(godhaar))  # stable order
-
-    # require at least 1 muzzle + face
-    if not face_path or len(muzzle_paths) == 0:
+    muzzle_paths = sorted(get_muzzle_paths(godhaar))
+    if not face_path:
         skipped_ids.append(godhaar)
         continue
-
-    # API supports max 5 muzzle images (muzzle_image_1 required, 2..5 optional)
+    if len(muzzle_paths) == 0:
+        muzzle_paths = [face_path]
     muzzle_paths = muzzle_paths[:5]
-
     left_path, right_path = get_side_paths(godhaar, face_path)
 
-    # ---- FILES ----
     files = []
     try:
         files.append(("front_image", open(face_path, "rb")))
         files.append(("left_image", open(left_path, "rb")))
         files.append(("right_image", open(right_path, "rb")))
-
         for i, m_path in enumerate(muzzle_paths, start=1):
             files.append((f"muzzle_image_{i}", open(m_path, "rb")))
 
-        # ---- DATA ----
-        # village: from main excel row
-        village = str(row.get("village", "")).strip()
+        village = get_from_sources("", row.get("village", ""), farmer_info.get("village", ""))
+        phone = clean_str(farmer_info.get("phonenumber", ""))
+        beneficiary_id = get_from_sources(
+            "",
+            farmer_info.get("beneficiary_id", ""),
+            farmer_info.get("farmerId", ""),
+            row.get("beneficiary_id", ""),
+            row.get("farmerId", ""),
+        )
 
-        # phone: from farmers excel, keyed by godhaar
-        phone = str(farmer_info.get("phonenumber", "")).strip()
-        if phone in ("nan", "None"):
-            phone = ""
+        register_state = map_register_state(
+            get_from_sources("AP", row.get("state", ""), farmer_info.get("state", ""))
+        )
+        register_district = map_register_district(
+            get_from_sources("TPT", row.get("district", ""), farmer_info.get("district", ""))
+        )
+        register_mandal = map_register_mandal(
+            get_from_sources("TPT01", row.get("mandal", ""), farmer_info.get("mandal", ""))
+        )
 
         data = {
-            "beneficiary_id": str(farmer_info.get("farmerId", row.get("farmerId", ""))),
+            "beneficiary_id": beneficiary_id,
             "godhaar_id": godhaar,
             "farmer_name": farmer_name,
             "animal_type": animal_type,
-            "breed": str(row["breed"]),
-            "age": parse_age(row["age"]),
-            "state": "AP",
-            "district": "TPT",
-            "mandal": "TPT01",
+            "breed": get_from_sources("", row.get("breed", ""), farmer_info.get("breed", "")),
+            "age": parse_age(row.get("age", "")),
+            "state": register_state,
+            "district": register_district,
+            "mandal": register_mandal,
             "village": village,
             "phone": phone,
         }
 
         # ---- API CALL ----
-        response = requests.post(API_URL, data=data, files=files, timeout=30)
+        response = request_with_retry(REGISTER_CATTLE_API_URL, data=data, files=files, timeout=30)
 
         if response.status_code in [200, 201]:
             success_ids.append(godhaar)
+            qr_animal_id = clean_str(milch_payload.get("animal_id", "")) or godhaar
+            qr_ok, qr_payload, qr_response = generate_qr(
+                qr_animal_id,
+                register_state,
+                register_district,
+                register_mandal,
+            )
+            if not qr_ok:
+                qr_failed_ids.append(godhaar)
+                print(f"\n❌ QR generation failed for {godhaar} -> {qr_response.status_code} | {qr_response.text}")
+                print(f"   qr animal_id: {qr_animal_id}")
+                print(f"   sent qr payload: {qr_payload}")
         else:
             failed_ids.append(godhaar)
-            file_keys = [k for k, _ in files]
             print(f"\n❌ {godhaar} → {response.status_code} | {response.text}")
-            print(f"   sent files: {file_keys}")
             print(f"   sent data: {data}")
 
     except Exception as e:
         failed_ids.append(godhaar)
         print(f"\n❌ Exception for {godhaar}: {e}")
-
     finally:
         for _, f in files:
             try:
                 f.close()
-            except:
+            except Exception:
                 pass
 
 # ===== SAVE LOGS =====
@@ -187,6 +432,15 @@ with open("failed_ids.txt", "w") as f:
 with open("skipped_ids.txt", "w") as f:
     f.write("\n".join(skipped_ids))
 
+with open("beneficiary_failed_ids.txt", "w") as f:
+    f.write("\n".join(beneficiary_failed_ids))
+
+with open("milchanimal_failed_ids.txt", "w") as f:
+    f.write("\n".join(milchanimal_failed_ids))
+
+with open("qr_failed_ids.txt", "w") as f:
+    f.write("\n".join(qr_failed_ids))
+
 # ===== SUMMARY =====
 print("\n" + "=" * 50)
 print("🔥 FINAL UPLOAD SUMMARY 🔥")
@@ -195,6 +449,9 @@ print(f"📊 Total Processed : {len(df)}")
 print(f"✅ Success         : {len(success_ids)}")
 print(f"❌ Failed          : {len(failed_ids)}")
 print(f"⚠️ Skipped         : {len(skipped_ids)}")
+print(f"👤 Beneficiary Fail: {len(beneficiary_failed_ids)}")
+print(f"🐄 Milchanimal Fail: {len(milchanimal_failed_ids)}")
+print(f"🔳 QR Fail         : {len(qr_failed_ids)}")
 
 if len(df) > 0:
     print(f"📈 Success Rate    : {round((len(success_ids)/len(df))*100, 2)}%")
@@ -204,4 +461,7 @@ print("📄 Logs saved:")
 print(" - success_ids.txt")
 print(" - failed_ids.txt")
 print(" - skipped_ids.txt")
+print(" - beneficiary_failed_ids.txt")
+print(" - milchanimal_failed_ids.txt")
+print(" - qr_failed_ids.txt")
 print("🚀 Done bro!")
