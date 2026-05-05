@@ -14,6 +14,7 @@ REGISTER_CATTLE_API_URL = "http://107.210.222.39:9000/registerCattle/manual"
 BENEFICIARY_API_URL = "http://107.210.222.39:9000/beneficiaries/"
 MILCHANIMALS_API_URL = "http://107.210.222.39:9000/milchanimals/"
 QR_GENERATE_API_URL = "http://107.210.222.39:9000/qr/generate"
+DEFAULT_DEV_API_KEY = "7f2d9b8c-3a1e-4f6b-9c2d-8e7a6b5c4d3f"
 
 main_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_Rural.xlsx"
 farmer_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_rural_farmers.xlsx"
@@ -226,11 +227,26 @@ def generate_qr(animal_id, state, district, mandal):
     return False, payload, response
 
 def request_with_retry(url, data=None, files=None, json=None, timeout=30):
+    api_key = os.getenv("API_X_KEY", DEFAULT_DEV_API_KEY).strip()
+    bearer_token = os.getenv("API_BEARER_TOKEN", "").strip()
+    headers = {}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
     last_response = None
     last_exception = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.post(url, data=data, files=files, json=json, timeout=timeout)
+            response = requests.post(
+                url,
+                data=data,
+                files=files,
+                json=json,
+                headers=headers,
+                timeout=timeout,
+            )
             # retry only transient server/network style statuses
             if response.status_code in (500, 502, 503, 504, 429):
                 last_response = response
