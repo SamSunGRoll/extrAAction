@@ -1,0 +1,4 @@
+myenv/
+failed_ids.txt
+skipped_ids.txt
+success_ids.txt

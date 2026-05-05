@@ -9,12 +9,12 @@ TEST_LIMIT = 10
 
 API_URL = "http://107.210.222.39:9000/registerCattle/manual"
 
-main_excel = "/home/sriram/Documents/extraction/Tirupati_Rural.xlsx"
-farmer_excel = "/home/sriram/Documents/extraction/Tirupati_rural_farmers.xlsx"
+main_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_Rural.xlsx"
+farmer_excel = "/home/codedreamer/Documents/GitHub/extrAAction/Tirupati_rural_farmers.xlsx"
 
-faces_dir = "/home/sriram/Documents/extraction/Tirupati_Rural_Faces"
-muzzle_dir = "/home/sriram/Documents/extraction/Tirupati_Rural_muzzles"
-sides_dir = "/home/sriram/Documents/extraction/Tirupati_Rural_Sides"
+faces_dir = "/home/codedreamer/Downloads/Tirupati_Rural_Faces"
+muzzle_dir = "/home/codedreamer/Downloads/Tirupati_Rural_Muzzle_fACES/Tirupati_Rural_Muzzle"
+sides_dir = "/home/codedreamer/Downloads/Tirupati_Rural_Sides"
 
 # ===== LOAD DATA =====
 df = pd.read_excel(main_excel, dtype=str)
