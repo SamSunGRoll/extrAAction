@@ -1,5 +1,6 @@
 import os
 import time
+import re
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -81,26 +82,43 @@ def get_from_sources(default, *values):
             return cleaned
     return default
 
+def get_ci(record, *keys):
+    if record is None:
+        return ""
+    lowered = {str(k).strip().lower(): v for k, v in record.items()}
+    for key in keys:
+        value = lowered.get(str(key).strip().lower(), "")
+        if clean_str(value) != "":
+            return value
+    return ""
+
 def build_location(row, farmer_info):
     lat = get_from_sources(
         "",
-        row.get("latitude", ""),
-        row.get("lat", ""),
-        farmer_info.get("latitude", ""),
-        farmer_info.get("lat", ""),
+        get_ci(row, "latitude", "lat"),
+        get_ci(farmer_info, "latitude", "lat"),
     )
     lon = get_from_sources(
         "",
-        row.get("longitude", ""),
-        row.get("lon", ""),
-        row.get("lng", ""),
-        farmer_info.get("longitude", ""),
-        farmer_info.get("lon", ""),
-        farmer_info.get("lng", ""),
+        get_ci(row, "longitude", "lon", "lng"),
+        get_ci(farmer_info, "longitude", "lon", "lng"),
     )
     if lat != "" and lon != "":
         return f"{lat},{lon}"
-    return get_from_sources("", row.get("location", ""), farmer_info.get("location", ""))
+
+    raw_location = get_from_sources("", row.get("location", ""), farmer_info.get("location", ""))
+    if raw_location == "":
+        return ""
+
+    # Handle dict/json-like text from Excel such as:
+    # "{'longitude': 79.47, 'latitude': 13.58, 'timestamp': '...'}"
+    lat_match = re.search(r"latitude['\"]?\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", raw_location)
+    lon_match = re.search(r"longitude['\"]?\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", raw_location)
+    if lat_match and lon_match:
+        return f"{lat_match.group(1)},{lon_match.group(1)}"
+
+    # Final fallback to always satisfy location regex expected by API.
+    return "0,0"
 
 def map_register_state(value):
     text = clean_str(value).lower()
@@ -220,6 +238,15 @@ def generate_qr(animal_id, state, district, mandal):
     response = request_with_retry(url, json=payload, timeout=30)
     if response.status_code in [200, 201]:
         return True, payload, response
+
+    # Backend may be eventually consistent after register/create; retry on 404.
+    if response.status_code == 404:
+        for _ in range(3):
+            time.sleep(2)
+            response = request_with_retry(url, json=payload, timeout=30)
+            if response.status_code in [200, 201]:
+                return True, payload, response
+
     return False, payload, response
 
 def request_with_retry(url, data=None, files=None, json=None, timeout=30):
@@ -342,6 +369,7 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
 
     # ---- Milchanimal Upsert ----
     milch_payload = {}
+    milchanimal_ok = False
     try:
         ok, milch_payload, milch_response = upsert_milchanimal(farmer_info, row, godhaar, animal_type)
         if not ok:
@@ -351,6 +379,8 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
                 continue
             print(f"\n❌ Milchanimal create failed for {godhaar} -> {milch_response.status_code} | {milch_response.text}")
             print(f"   sent milchanimal payload: {milch_payload}")
+        else:
+            milchanimal_ok = True
     except Exception as e:
         milchanimal_failed_ids.append(godhaar)
         print(f"\n❌ Milchanimal exception for {godhaar}: {e}")
@@ -413,18 +443,22 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Uploading"):
 
         if response.status_code in [200, 201]:
             success_ids.append(godhaar)
-            qr_animal_id = clean_str(milch_payload.get("animal_id", "")) or godhaar
-            qr_ok, qr_payload, qr_response = generate_qr(
-                qr_animal_id,
-                register_state,
-                register_district,
-                register_mandal,
-            )
-            if not qr_ok:
+            if milchanimal_ok:
+                qr_animal_id = clean_str(milch_payload.get("animal_id", "")) or godhaar
+                qr_ok, qr_payload, qr_response = generate_qr(
+                    qr_animal_id,
+                    register_state,
+                    register_district,
+                    register_mandal,
+                )
+                if not qr_ok:
+                    qr_failed_ids.append(godhaar)
+                    print(f"\n❌ QR generation failed for {godhaar} -> {qr_response.status_code} | {qr_response.text}")
+                    print(f"   qr animal_id: {qr_animal_id}")
+                    print(f"   sent qr payload: {qr_payload}")
+            else:
                 qr_failed_ids.append(godhaar)
-                print(f"\n❌ QR generation failed for {godhaar} -> {qr_response.status_code} | {qr_response.text}")
-                print(f"   qr animal_id: {qr_animal_id}")
-                print(f"   sent qr payload: {qr_payload}")
+                print(f"\n⚠️ QR skipped for {godhaar} because milchanimal creation failed.")
         else:
             failed_ids.append(godhaar)
             print(f"\n❌ {godhaar} → {response.status_code} | {response.text}")
